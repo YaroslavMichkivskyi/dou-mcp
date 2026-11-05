@@ -29,12 +29,14 @@ sys.path.insert(0, str(HERE))
 from mcpkit import (McpServer, SiteSession, Stop, check_upload, clean, html_to_text, inner_html,  # noqa: E402
                     load_env, log, override_form, page_links, page_main, page_title, parse_form)
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SITE = "https://dou.ua"
 JOBS = "https://jobs.dou.ua"
 HOSTS = ("dou.ua", "jobs.dou.ua")
 UNSAFE_PATH = re.compile(r"logout|delete|remove|deactivat|unsubscrib|apply|respond|reject|accept|withdraw|"
                          r"toggle|subscribe|vote|/send|/new/|/\d+/(?:un)?(?:archive|hide|block|ban)\b", re.I)
+# links like ?action=decline change state even though they are plain GETs
+UNSAFE_QUERY = re.compile(r"(?:^|&)(?:action|do|op|cmd|method)=", re.I)
 CATEGORIES = (
     ".NET", "AI/ML", "Analyst", "Android", "Architect", "Big Data", "Blockchain", "C++",
     "Data Engineer", "Data Science", "DBA", "DevOps", "Embedded", "Engineering Manager",
@@ -160,7 +162,8 @@ def _login() -> dict:
 def _get(url: str, *, account: bool = True) -> tuple[str, str]:
     """GET a page; for account pages log in once if the session is gone."""
     url = url if url.startswith("https://") else urllib.parse.urljoin(SITE, url)
-    if UNSAFE_PATH.search(urllib.parse.urlsplit(url).path):
+    parts = urllib.parse.urlsplit(url)
+    if UNSAFE_PATH.search(parts.path) or UNSAFE_QUERY.search(parts.query):
         raise Stop(f"{url} looks like an action link (changes the account) — not opened")
     final, status, page = session.request(url)
     if account and not _user_id(page):

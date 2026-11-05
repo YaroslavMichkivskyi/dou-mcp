@@ -279,8 +279,11 @@ def parse_form(form_html: str) -> dict:
             if not chosen and options and not multiple:
                 chosen = [options[0]["value"]]
             pairs += [(name, v) for v in chosen]
+            labels = {o["value"]: o["label"] for o in options}
             fields[name] = {"type": "select-multiple" if multiple else "select",
-                            "value": chosen if multiple else (chosen[0] if chosen else None), "options": options}
+                            "value": chosen if multiple else (chosen[0] if chosen else None),
+                            "label": [labels.get(v) for v in chosen] if multiple else
+                            (labels.get(chosen[0]) if chosen else None), "options": options}
             continue
         value = html.unescape(inner) if kind == "textarea" else (attr(attrs, "value") or "")
         if kind == "textarea" and value.startswith("\n"):
