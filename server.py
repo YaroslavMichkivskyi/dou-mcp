@@ -30,7 +30,7 @@ from mcpkit import (DRY_RUN_PROP, PAGING_PROPS, McpServer, SiteSession, Stop, ch
                     csrf_token, html_to_text, inner_html, is_action_link, load_env, log, override_form, page_links,
                     page_main, page_title, parse_form, slice_text)
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 SITE = "https://dou.ua"
 JOBS = "https://jobs.dou.ua"
 HOSTS = ("dou.ua", "jobs.dou.ua")

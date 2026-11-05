@@ -336,6 +336,8 @@ def parse_form(form_html: str) -> dict:
         value = html.unescape(inner) if kind == "textarea" else (attr(attrs, "value") or "")
         if kind == "textarea" and value.startswith("\n"):
             value = value[1:]
+        if typ in ("number", "range") and not re.fullmatch(r"\s*-?\d+(?:\.\d+)?\s*", value):
+            value = ""  # a browser drops a non-numeric value (Djinni renders an empty one as "None")
         pairs.append((name, value))
         fields[name] = {"type": typ, "value": value}
     return {"pairs": pairs, "fields": fields}
