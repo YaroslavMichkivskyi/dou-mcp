@@ -26,17 +26,17 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from mcpkit import (McpServer, SiteSession, Stop, check_upload, clean, html_to_text, inner_html,  # noqa: E402
-                    load_env, log, override_form, page_links, page_main, page_title, parse_form)
+from mcpkit import (DRY_RUN_PROP, PAGING_PROPS, McpServer, SiteSession, Stop, check_upload, clean,  # noqa: E402
+                    csrf_token, html_to_text, inner_html, is_action_link, load_env, log, override_form, page_links,
+                    page_main, page_title, parse_form, slice_text)
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 SITE = "https://dou.ua"
 JOBS = "https://jobs.dou.ua"
 HOSTS = ("dou.ua", "jobs.dou.ua")
-UNSAFE_PATH = re.compile(r"logout|delete|remove|deactivat|unsubscrib|apply|respond|reject|accept|withdraw|"
-                         r"toggle|subscribe|vote|/send|/new/|/\d+/(?:un)?(?:archive|hide|block|ban)\b", re.I)
-# links like ?action=decline change state even though they are plain GETs
-UNSAFE_QUERY = re.compile(r"(?:^|&)(?:action|do|op|cmd|method)=", re.I)
+# Path segments of links that change state on a plain GET (whole segments, so slugs are safe).
+ACTION_SEGMENTS = re.compile(r"logout.*|delete.*|remove.*|deactivat.*|unsubscrib.*|apply|respond|reject|accept|"
+                             r"withdraw|toggle.*|(?:un)?subscribe|vote|send|new|(?:un)?archive|hide|block|ban", re.I)
 CATEGORIES = (
     ".NET", "AI/ML", "Analyst", "Android", "Architect", "Big Data", "Blockchain", "C++",
     "Data Engineer", "Data Science", "DBA", "DevOps", "Embedded", "Engineering Manager",
@@ -57,12 +57,8 @@ server = McpServer("dou", VERSION, instructions=(
     "get an explicit OK before the real call. Never send or apply on your own initiative."))
 session: SiteSession  # set in main()
 
-DRY_RUN = {"dry_run": {"type": "boolean", "default": False,
-                       "description": "true: validate and return exactly what would be sent, send nothing"}}
-PAGING = {
-    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "start of the text slice"},
-    "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "default": 15000},
-}
+DRY_RUN, PAGING = DRY_RUN_PROP, PAGING_PROPS
+_csrf, _slice = csrf_token, slice_text
 
 
 # ---------------------------------------------------------------- helpers ---
@@ -94,30 +90,21 @@ def _text(page: str) -> str:
     return re.sub(r"^.*?Доступ до цієї сторінки є лише у Вашого акаунта\s*", "", text, flags=re.S)
 
 
-def _csrf(page: str) -> str:
-    m = re.search(r"name=['\"]csrfmiddlewaretoken['\"] value=['\"]([^'\"]+)", page) or \
-        re.search(r"CSRF_TOKEN\s*=\s*['\"]([^'\"]+)", page)
-    if not m:
-        raise Stop("no CSRF token on the page — markup changed or not logged in")
-    return m.group(1)
-
-
 def _ua_date(text: str) -> str | None:
+    """'13 жовтня' / '25 вересня 2026' → ISO date; None for anything odd (never raises)."""
     m = re.search(r"(\d{1,2})\s+([а-яіїєґ']+)(?:\s+(\d{4}))?", (text or "").lower())
     if not m or m.group(2) not in UA_MONTHS:
         return None
     today = date.today()
-    d = date(int(m.group(3)) if m.group(3) else today.year, UA_MONTHS[m.group(2)], int(m.group(1)))
-    if not m.group(3) and d > today:
-        d = d.replace(year=d.year - 1)
-    return d.isoformat()
-
-
-def _slice(text: str, offset: int, max_chars: int) -> dict:
-    out = {"chars": len(text), "text": text[offset:offset + max_chars]}
-    if offset + max_chars < len(text):
-        out["next_offset"] = offset + max_chars
-    return out
+    year, month, day = int(m.group(3)) if m.group(3) else today.year, UA_MONTHS[m.group(2)], int(m.group(1))
+    for y in ((year,) if m.group(3) else (year, year - 1)):  # no year given: the latest date not in the future
+        try:
+            d = date(y, month, day)
+        except ValueError:  # 31 квітня, 29 лютого in a non-leap year
+            continue
+        if m.group(3) or d <= today:
+            return d.isoformat()
+    return None
 
 
 # ------------------------------------------------------------------ login ---
@@ -163,7 +150,7 @@ def _get(url: str, *, account: bool = True) -> tuple[str, str]:
     """GET a page; for account pages log in once if the session is gone."""
     url = url if url.startswith("https://") else urllib.parse.urljoin(SITE, url)
     parts = urllib.parse.urlsplit(url)
-    if UNSAFE_PATH.search(parts.path) or UNSAFE_QUERY.search(parts.query):
+    if is_action_link(url, ACTION_SEGMENTS):
         raise Stop(f"{url} looks like an action link (changes the account) — not opened")
     final, status, page = session.request(url)
     if account and not _user_id(page):
@@ -399,18 +386,18 @@ def send_message(user: str, text: str, reply_to: str | None = None, attachment: 
     payload = {"to": user, "text": text, "reply_to": reply_to, "attachment": file.name if file else None}
     if dry_run:
         return {"dry_run": True, "url": final, "would_send": payload}
-    before = len(_messages(page))
-    _, status, body = session.request(final, data=[("csrfmiddlewaretoken", _csrf(page)),
-                                                   ("reply_to", reply_to or ""), ("message", text)],
-                                      files=[("file", file)] if file else None,
-                                      headers={"Referer": final, "Origin": SITE})
+    before = {m["id"] for m in _messages(page)}
+    _, status, _ = session.request(final, data=[("csrfmiddlewaretoken", _csrf(page)),
+                                                ("reply_to", reply_to or ""), ("message", text)],
+                                   files=[("file", file)] if file else None,
+                                   headers={"Referer": final, "Origin": SITE})
     if status >= 400:
         raise Stop(f"HTTP {status} sending the message")
     _, page = _get(url)
-    msgs = _messages(page)
-    sent = len(msgs) > before and msgs[-1]["from_me"]
-    return {"sent": sent, "message": msgs[-1] if sent else None,
-            "note": None if sent else "the thread did not grow — check get_conversation before retrying"}
+    # compare message ids, not counts: a long thread may render only a window of messages
+    new = [m for m in _messages(page) if m["id"] not in before and m["from_me"]]
+    return {"sent": bool(new), "message": new[-1] if new else None,
+            "note": None if new else "no new message of mine in the thread — check get_conversation before retrying"}
 
 
 def _vacancy_page(url: str) -> tuple[str, str]:
@@ -447,12 +434,15 @@ def apply_to_job(url: str, cover_letter: str, cv: str | None = None, dry_run: bo
     if not form:
         raise Stop("this vacancy has no DOU response form (it may link to an external site) — apply there")
     parsed = parse_form(form.group(1))
+    # build the real request before answering a dry run, so a dry run fails exactly where the send would
+    pairs = override_form(parsed["pairs"], parsed["fields"], {"descr": cover_letter})
+    if file and parsed["fields"].get("user_cv", {}).get("type") != "file":
+        raise Stop("this vacancy's form has no CV upload field — send without `cv`")
     title = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.S)
     payload = {"vacancy": clean(title.group(1)) if title else final, "url": final,
                "cover_letter": cover_letter, "cv": file.name if file else None}
     if dry_run:
         return {"dry_run": True, "would_send": payload}
-    pairs = override_form(parsed["pairs"], parsed["fields"], {"descr": cover_letter})
     _, status, _ = session.request(final, data=pairs, files=[("user_cv", file)] if file else None,
                                    headers={"Referer": final, "Origin": JOBS})
     if status >= 400:
@@ -556,7 +546,8 @@ def get_job(url: str) -> dict:
              {"company": {"type": "string", "description": "slug from jobs.dou.ua/companies/<slug>/ or that URL"},
               "vacancies": {"type": "boolean", "default": True}}, ["company"], title="Company")
 def get_company(company: str, vacancies: bool = True) -> dict:
-    m = re.search(r"(?:companies/)?([A-Za-z0-9_.-]+)/?$", company.strip().split("?")[0].rstrip("/") + "/")
+    value = company.strip().split("?")[0]
+    m = re.search(r"/companies/([^/]+)", value) if "/" in value else re.fullmatch(r"([^/]+)", value)
     slug = m.group(1) if m else ""
     if not SLUG.match(slug):
         raise Stop("give the company slug or its jobs.dou.ua/companies/<slug>/ URL")

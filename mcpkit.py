@@ -36,10 +36,10 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
-BLOCK_MARKERS = (
-    "cf-chl-", "challenge-platform", "Just a moment...", "Attention Required!",
-    "g-recaptcha", "hcaptcha", "captcha-delivery",
-)
+# A challenge page for sure — on any status.
+BLOCK_MARKERS = ("cf-chl-", "Just a moment...", "Attention Required!", "captcha-delivery")
+# Also embedded in ordinary pages (captcha widgets, Cloudflare scripts) — a block only on an error status.
+WEAK_BLOCK_MARKERS = ("challenge-platform", "g-recaptcha", "hcaptcha")
 
 
 class Stop(Exception):
@@ -198,7 +198,7 @@ class SiteSession:
         finally:
             self.save_cookies()
         log(f"{'POST' if body else 'GET'} {status} {url}" + (f" → {final}" if final != url else ""))
-        if any(m in text for m in BLOCK_MARKERS):
+        if any(m in text for m in BLOCK_MARKERS) or (status >= 400 and any(m in text for m in WEAK_BLOCK_MARKERS)):
             raise Stop(f"anti-bot challenge on {url} — stopped; log in once in a normal browser and try later")
         return final, status, text
 
@@ -232,7 +232,59 @@ def check_upload(path: str, max_mb: float = 10) -> Path:
     return p
 
 
+# ------------------------------------------------------------ shared bits ---
+
+DRY_RUN_PROP = {"dry_run": {"type": "boolean", "default": False,
+                            "description": "true: validate and return exactly what would be sent, send nothing"}}
+PAGING_PROPS = {
+    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "start of the text slice"},
+    "max_chars": {"type": "integer", "minimum": 500, "maximum": 60000, "default": 15000},
+}
+
+
+def slice_text(text: str, offset: int, max_chars: int) -> dict:
+    out = {"chars": len(text), "text": text[offset:offset + max_chars]}
+    if offset + max_chars < len(text):
+        out["next_offset"] = offset + max_chars
+    return out
+
+
+def csrf_token(page: str) -> str:
+    """Django CSRF token from a form field, a data attribute or a JS variable."""
+    m = (re.search(r"name=['\"]csrfmiddlewaretoken['\"]\s+value=['\"]([^'\"]+)", page)
+         or re.search(r'data-csrf-token="([^"]+)"', page)
+         or re.search(r"CSRF_TOKEN\s*=\s*['\"]([^'\"]+)", page))
+    if not m:
+        raise Stop("no CSRF token on the page — markup changed or not logged in")
+    return m.group(1)
+
+
+def is_action_link(url: str, segments: re.Pattern) -> bool:
+    """True for links that change state on a plain GET: a path *segment* that
+    fully matches `segments` (so a vacancy slug like '…-skills' is not 'kill'),
+    or an action-style query key (`?action=decline`)."""
+    parts = urllib.parse.urlsplit(url)
+    if any(segments.fullmatch(s) for s in parts.path.split("/") if s):
+        return True
+    return bool(re.search(r"(?:^|&)(?:action|do|op|cmd|method)=", parts.query, re.I))
+
+
 # ------------------------------------------------------------------ forms ---
+
+def _strip_values(attrs: str) -> str:
+    return re.sub(r"""(["']).*?\1""", '""', attrs, flags=re.S)
+
+
+def has_flag(attrs: str, flag: str) -> bool:
+    """A boolean attribute (checked, selected, disabled, multiple) — not data-checked, not a class token."""
+    return bool(re.search(rf"(?<![\w-]){flag}(?![\w-])", _strip_values(attrs), re.I))
+
+
+def attr(attrs: str, name: str) -> str | None:
+    """An attribute's value — `value`, never `data-value`."""
+    m = re.search(rf"""(?<![\w-]){name}\s*=\s*(["'])(.*?)\1""", attrs, re.S | re.I)
+    return html.unescape(m.group(2)) if m else None
+
 
 def parse_form(form_html: str) -> dict:
     """Current state of an HTML form, as a browser would submit it, plus the
@@ -245,13 +297,9 @@ def parse_form(form_html: str) -> dict:
     tags += [(t.start(), t.group(1).lower(), t.group(2), t.group(3))
              for t in re.finditer(r"<(textarea|select)\b([^>]*)>(.*?)</\1>", form_html, re.S | re.I)]
 
-    def attr(attrs: str, name: str) -> str | None:
-        m = re.search(rf'\b{name}\s*=\s*(["\'])(.*?)\1', attrs, re.S)
-        return html.unescape(m.group(2)) if m else None
-
     for _, kind, attrs, inner in sorted(tags, key=lambda t: t[0]):
         name = attr(attrs, "name")
-        if not name or re.search(r"\bdisabled\b", attrs):
+        if not name or has_flag(attrs, "disabled"):
             continue
         typ = (attr(attrs, "type") or "text").lower() if kind == "input" else kind
         if typ in ("submit", "button", "image", "reset"):
@@ -263,7 +311,7 @@ def parse_form(form_html: str) -> dict:
             value = attr(attrs, "value") or "on"
             f = fields.setdefault(name, {"type": typ, "value": [] if typ == "checkbox" else None, "options": []})
             f["options"].append(value)
-            if re.search(r"\bchecked\b", attrs):
+            if has_flag(attrs, "checked"):
                 pairs.append((name, value))
                 if typ == "checkbox":
                     f["value"].append(value)
@@ -274,8 +322,8 @@ def parse_form(form_html: str) -> dict:
             opts = re.findall(r"<option\b([^>]*)>(.*?)</option>", inner, re.S | re.I)
             options = [{"value": attr(a, "value") if attr(a, "value") is not None else clean(t), "label": clean(t)}
                        for a, t in opts]
-            chosen = [o["value"] for (a, _), o in zip(opts, options) if re.search(r"\bselected\b", a)]
-            multiple = bool(re.search(r"\bmultiple\b", attrs))
+            chosen = [o["value"] for (a, _), o in zip(opts, options) if has_flag(a, "selected")]
+            multiple = has_flag(attrs, "multiple")
             if not chosen and options and not multiple:
                 chosen = [options[0]["value"]]
             pairs += [(name, v) for v in chosen]
@@ -304,8 +352,11 @@ def override_form(pairs: list[tuple[str, str]], fields: dict, changes: dict) -> 
         if f.get("type") == "file":
             raise Stop(f"'{name}' is a file field — not editable here")
         if f["type"] == "checkbox" and isinstance(value, bool):
+            options = [o["value"] if isinstance(o, dict) else o for o in f.get("options", [])]
+            if len(options) != 1:
+                raise Stop(f"'{name}' is a group of {len(options)} checkboxes — give a list of values, not true/false")
             if value:
-                out.append((name, f["options"][0] if len(f["options"]) == 1 else "on"))
+                out.append((name, options[0]))
             continue
         values = value if isinstance(value, list) else [value]
         allowed = {o["value"] if isinstance(o, dict) else o for o in f.get("options", [])}
@@ -475,13 +526,18 @@ class McpServer:
             tool = self.tools.get(params.get("name"))
             if not tool or params.get("name") in self.hidden:
                 raise LookupError(f"unknown tool {params.get('name')}")
+            args = params.get("arguments") or {}
+            schema = tool["spec"]["inputSchema"]
+            problem = ("arguments must be an object" if not isinstance(args, dict) else
+                       next((f"unknown argument '{k}'" for k in args if k not in schema["properties"]), None) or
+                       next((f"missing argument '{k}'" for k in schema["required"] if k not in args), None))
+            if problem:
+                return {"content": [{"type": "text", "text": f"bad arguments: {problem}"}], "isError": True}
             try:
-                return self._result(tool["fn"](**(params.get("arguments") or {})))
+                return self._result(tool["fn"](**args))
             except Stop as e:
                 return {"content": [{"type": "text", "text": f"stopped: {e}"}], "isError": True}
-            except TypeError as e:
-                return {"content": [{"type": "text", "text": f"bad arguments: {e}"}], "isError": True}
-            except Exception as e:  # report, keep the server alive
+            except Exception as e:  # a bug in the tool: log it, keep the server alive
                 log(traceback.format_exc())
                 return {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}
         raise LookupError(f"method not found: {method}")
@@ -500,7 +556,7 @@ class McpServer:
                 msg = json.loads(line)
             except ValueError:
                 continue
-            if "id" not in msg:  # notification
+            if not isinstance(msg, dict) or "id" not in msg:  # notification or junk
                 continue
             try:
                 reply = {"jsonrpc": "2.0", "id": msg["id"], "result": self._handle(msg)}
